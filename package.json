@@ -1,0 +1,99 @@
+{
+	"name": "complementry",
+	"displayName": "Complementry",
+	"description": "Enhanced markdown inline completions with LLM support - control prompts, context files, and when completions run",
+	"version": "0.0.1",
+	"publisher": "gilikv",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/gilikv/complementry"
+	},
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onLanguage:markdown"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "complementry.triggerCompletion",
+				"title": "Complementry: Trigger Completion"
+			},
+			{
+				"command": "complementry.configure",
+				"title": "Complementry: Configure Document Settings"
+			},
+			{
+				"command": "complementry.addContextFile",
+				"title": "Complementry: Add Context File"
+			},
+			{
+				"command": "complementry.removeContextFile",
+				"title": "Complementry: Remove Context File"
+			},
+			{
+				"command": "complementry.setPromptTemplate",
+				"title": "Complementry: Set Prompt Template"
+			}
+		],
+		"keybindings": [
+			{
+				"command": "complementry.triggerCompletion",
+				"key": "ctrl+shift+space",
+				"mac": "cmd+shift+space",
+				"when": "editorTextFocus && editorLangId == markdown"
+			}
+		],
+		"configuration": {
+			"title": "Complementry",
+			"properties": {
+				"complementry.defaultPromptTemplate": {
+					"type": "string",
+					"default": "Continue writing the following markdown document naturally. Only provide the continuation text, no explanations:\n\n{document}\n\nContinuation:",
+					"description": "Default prompt template for completions. Use {document} for the current document content, {cursor} for cursor position context."
+				},
+				"complementry.apiEndpoint": {
+					"type": "string",
+					"default": "",
+					"description": "LLM API endpoint URL"
+				},
+				"complementry.apiKey": {
+					"type": "string",
+					"default": "",
+					"description": "API key for the LLM service"
+				},
+				"complementry.model": {
+					"type": "string",
+					"default": "gpt-4",
+					"description": "Model to use for completions"
+				},
+				"complementry.maxTokens": {
+					"type": "number",
+					"default": 150,
+					"description": "Maximum tokens for completion response"
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"lint": "eslint src --ext ts",
+		"watch": "tsc -watch -p ./",
+		"pretest": "npm run compile && npm run lint",
+		"test": "node ./out/test/runTest.js"
+	},
+	"devDependencies": {
+		"@types/node": "^20.10.0",
+		"@types/vscode": "^1.85.0",
+		"@typescript-eslint/eslint-plugin": "^6.13.0",
+		"@typescript-eslint/parser": "^6.13.0",
+		"eslint": "^8.54.0",
+		"typescript": "^5.3.0"
+	}
+}
