@@ -74,76 +74,89 @@ class DocumentSettingsManager {
 }
 
 /**
- * Manages the completion state - we only provide completions when triggered manually
+ * Manages pending LLM requests.
+ *
+ * Key insight: VS Code caches null results based on (position, documentVersion).
+ * If we return null before LLM responds, VS Code caches it and won't call us again.
+ *
+ * Solution: Return a Promise that waits for the LLM response instead of null.
+ * When the provider is called and there's a pending request, we return the Promise.
+ * VS Code will wait for it to resolve with the actual completion.
  */
-class CompletionTriggerManager {
-	private pendingCompletion: {
+class CompletionRequestManager {
+	private pendingRequest: {
 		documentUri: string;
 		position: vscode.Position;
+		promise: Promise<vscode.InlineCompletionItem[]>;
 		resolve: (items: vscode.InlineCompletionItem[]) => void;
 	} | null = null;
 
-	private completionResult: vscode.InlineCompletionItem[] | null = null;
-	private completionDocUri: string | null = null;
-	private lastCompletionText: string | null = null;
-	private resultCallCount = 0;
-
-	setPendingCompletion(
-		documentUri: string,
-		position: vscode.Position,
-		resolve: (items: vscode.InlineCompletionItem[]) => void
-	): void {
-		this.pendingCompletion = { documentUri, position, resolve };
-	}
-
-	setCompletionResult(documentUri: string, items: vscode.InlineCompletionItem[]): void {
-		this.completionResult = items;
-		this.completionDocUri = documentUri;
-		this.resultCallCount = 0;
-		// Store the text for fallback insertion
-		if (items.length > 0 && items[0].insertText) {
-			this.lastCompletionText = typeof items[0].insertText === 'string'
-				? items[0].insertText
-				: items[0].insertText.value;
+	/**
+	 * Start a new completion request. Returns a promise that the provider will return to VS Code.
+	 */
+	createPendingRequest(documentUri: string, position: vscode.Position): void {
+		// Cancel any existing request
+		if (this.pendingRequest) {
+			log('CompletionRequestManager: cancelling previous request');
+			this.pendingRequest.resolve([]);
 		}
-		log(`CompletionTriggerManager: stored result for ${documentUri}`);
+
+		let resolveFunc!: (items: vscode.InlineCompletionItem[]) => void;
+		const promise = new Promise<vscode.InlineCompletionItem[]>((resolve) => {
+			resolveFunc = resolve;
+		});
+
+		this.pendingRequest = {
+			documentUri,
+			position,
+			promise,
+			resolve: resolveFunc,
+		};
+
+		log(`CompletionRequestManager: created pending request for ${documentUri} at ${position.line}:${position.character}`);
 	}
 
-	getCompletionResult(documentUri: string): vscode.InlineCompletionItem[] | null {
-		log(`CompletionTriggerManager: getCompletionResult called`);
-		log(`  - requested: ${documentUri}`);
-		log(`  - stored: ${this.completionDocUri}`);
-		log(`  - has result: ${!!this.completionResult}`);
-		log(`  - call count: ${this.resultCallCount}`);
+	/**
+	 * Complete the pending request with LLM results.
+	 */
+	resolveRequest(items: vscode.InlineCompletionItem[]): void {
+		if (this.pendingRequest) {
+			log(`CompletionRequestManager: resolving request with ${items.length} items`);
+			this.pendingRequest.resolve(items);
+			this.pendingRequest = null;
+		} else {
+			log('CompletionRequestManager: no pending request to resolve');
+		}
+	}
 
-		if (this.completionDocUri === documentUri && this.completionResult) {
-			this.resultCallCount++;
-			// Keep result available for a few calls (VS Code may call multiple times)
-			if (this.resultCallCount > 3) {
-				log('Clearing result after multiple calls');
-				const result = this.completionResult;
-				this.completionResult = null;
-				this.completionDocUri = null;
-				return result;
-			}
-			return this.completionResult;
+	/**
+	 * Check if there's a pending request for this document.
+	 * Returns the promise if there is one (provider should return this to VS Code).
+	 */
+	getPendingPromise(documentUri: string): Promise<vscode.InlineCompletionItem[]> | null {
+		if (this.pendingRequest && this.pendingRequest.documentUri === documentUri) {
+			log(`CompletionRequestManager: returning pending promise for provider`);
+			return this.pendingRequest.promise;
 		}
 		return null;
 	}
 
-	getLastCompletionText(): string | null {
-		return this.lastCompletionText;
+	/**
+	 * Check if there's a pending request (for any document).
+	 */
+	hasPendingRequest(): boolean {
+		return this.pendingRequest !== null;
 	}
 
-	clearResult(): void {
-		this.completionResult = null;
-		this.completionDocUri = null;
-	}
-
-	consumePending(): typeof this.pendingCompletion {
-		const pending = this.pendingCompletion;
-		this.pendingCompletion = null;
-		return pending;
+	/**
+	 * Cancel any pending request.
+	 */
+	cancelRequest(): void {
+		if (this.pendingRequest) {
+			log(`CompletionRequestManager: cancelling request`);
+			this.pendingRequest.resolve([]);
+			this.pendingRequest = null;
+		}
 	}
 }
 
@@ -249,14 +262,18 @@ class PromptBuilder {
 }
 
 /**
- * Inline completion provider that only provides completions when manually triggered
+ * Inline completion provider that returns a Promise when there's a pending LLM request.
+ *
+ * This is the key to making inline completions work reliably:
+ * - When user triggers completion, we create a pending request with a Promise
+ * - We then call VS Code's trigger command, which calls this provider
+ * - Instead of returning null (which gets cached), we return the Promise
+ * - VS Code waits for the Promise to resolve with the actual completion
+ * - When LLM responds, we resolve the Promise
  */
 class ComplementryCompletionProvider implements vscode.InlineCompletionItemProvider {
 	constructor(
-		private triggerManager: CompletionTriggerManager,
-		private settingsManager: DocumentSettingsManager,
-		private llmService: LLMService,
-		private promptBuilder: PromptBuilder
+		private requestManager: CompletionRequestManager
 	) {}
 
 	async provideInlineCompletionItems(
@@ -276,17 +293,15 @@ class ComplementryCompletionProvider implements vscode.InlineCompletionItemProvi
 			return null;
 		}
 
-		// Check if we have a pre-computed completion result
-		const precomputed = this.triggerManager.getCompletionResult(document.uri.toString());
-		log(`Precomputed result: ${precomputed ? `${precomputed.length} items` : 'null'}`);
-
-		if (precomputed) {
-			log('Returning precomputed completion');
-			return precomputed;
+		// Check if there's a pending request - return its Promise so VS Code waits
+		const pendingPromise = this.requestManager.getPendingPromise(document.uri.toString());
+		if (pendingPromise) {
+			log('Returning pending promise - VS Code will wait for LLM response');
+			return pendingPromise;
 		}
 
-		// We don't provide automatic completions - only manual triggers
-		log('No precomputed result, returning null');
+		// No pending request - don't provide automatic completions
+		log('No pending request, returning null');
 		return null;
 	}
 }
@@ -307,17 +322,12 @@ export function activate(context: vscode.ExtensionContext) {
 	log('Complementry extension activating...');
 
 	const settingsManager = new DocumentSettingsManager();
-	const triggerManager = new CompletionTriggerManager();
+	const requestManager = new CompletionRequestManager();
 	const llmService = new LLMService();
 	const promptBuilder = new PromptBuilder(settingsManager);
 
 	// Register the inline completion provider
-	const provider = new ComplementryCompletionProvider(
-		triggerManager,
-		settingsManager,
-		llmService,
-		promptBuilder
-	);
+	const provider = new ComplementryCompletionProvider(requestManager);
 
 	context.subscriptions.push(
 		vscode.languages.registerInlineCompletionItemProvider(
@@ -347,29 +357,37 @@ export function activate(context: vscode.ExtensionContext) {
 
 			setStatus('Fetching...', 'loading~spin');
 
+			// 1. Create pending request - this creates a Promise that provider will return
+			requestManager.createPendingRequest(document.uri.toString(), position);
+
+			// 2. Start LLM request in background (don't await yet)
 			const defaultTemplate = config.get<string>(
 				'defaultPromptTemplate',
 				'Continue writing the following markdown document naturally. Only provide the continuation text, no explanations:\n\n{document}\n\nContinuation:'
 			);
 
-			const prompt = await promptBuilder.buildPrompt(document, position, defaultTemplate);
-			const completion = await llmService.getCompletion(prompt, config);
+			const llmPromise = (async () => {
+				const prompt = await promptBuilder.buildPrompt(document, position, defaultTemplate);
+				return await llmService.getCompletion(prompt, config);
+			})();
 
+			// 3. Trigger VS Code to call our provider (don't await - it would deadlock)
+			//    Provider returns the Promise, VS Code waits for it
+			log('Triggering inline suggest...');
+			vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
+			log('Inline suggest triggered');
+
+			// 4. Wait for LLM and resolve the Promise
+			const completion = await llmPromise;
 			log(`Completion received: ${completion ? `${completion.length} chars` : 'NULL'}`);
 
 			if (completion) {
 				const item = new vscode.InlineCompletionItem(completion);
 				item.range = new vscode.Range(position, position);
-
-				triggerManager.setCompletionResult(document.uri.toString(), [item]);
-				log('Triggering inline suggest...');
-
-				// Trigger VS Code to request inline completions
-				await vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
-				log('Inline suggest triggered');
+				requestManager.resolveRequest([item]);
 				setStatus('Ready - Tab to accept', 'check', 5000);
 			} else {
-				log('WARNING: No completion returned from LLM');
+				requestManager.resolveRequest([]);
 				setStatus('No completion', 'warning', 3000);
 			}
 		})
