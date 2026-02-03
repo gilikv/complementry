@@ -1,4 +1,31 @@
 import * as vscode from 'vscode';
+import { generateText } from 'ai';
+import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
+import { defaultProvider } from '@aws-sdk/credential-provider-node';
+
+// Output channel for debugging
+let outputChannel: vscode.OutputChannel;
+let statusBarItem: vscode.StatusBarItem;
+
+function log(message: string, data?: unknown) {
+	const timestamp = new Date().toISOString();
+	outputChannel.appendLine(`[${timestamp}] ${message}`);
+	if (data !== undefined) {
+		outputChannel.appendLine(JSON.stringify(data, null, 2));
+	}
+}
+
+function setStatus(text: string, icon?: string, timeout?: number) {
+	const iconStr = icon ? `$(${icon}) ` : '';
+	statusBarItem.text = `${iconStr}${text}`;
+	statusBarItem.show();
+
+	if (timeout) {
+		setTimeout(() => {
+			statusBarItem.text = '$(sparkle) Complementry';
+		}, timeout);
+	}
+}
 
 /**
  * Per-document settings for Complementry
@@ -58,6 +85,8 @@ class CompletionTriggerManager {
 
 	private completionResult: vscode.InlineCompletionItem[] | null = null;
 	private completionDocUri: string | null = null;
+	private lastCompletionText: string | null = null;
+	private resultCallCount = 0;
 
 	setPendingCompletion(
 		documentUri: string,
@@ -70,16 +99,45 @@ class CompletionTriggerManager {
 	setCompletionResult(documentUri: string, items: vscode.InlineCompletionItem[]): void {
 		this.completionResult = items;
 		this.completionDocUri = documentUri;
+		this.resultCallCount = 0;
+		// Store the text for fallback insertion
+		if (items.length > 0 && items[0].insertText) {
+			this.lastCompletionText = typeof items[0].insertText === 'string'
+				? items[0].insertText
+				: items[0].insertText.value;
+		}
+		log(`CompletionTriggerManager: stored result for ${documentUri}`);
 	}
 
 	getCompletionResult(documentUri: string): vscode.InlineCompletionItem[] | null {
-		if (this.completionDocUri === documentUri) {
-			const result = this.completionResult;
-			this.completionResult = null;
-			this.completionDocUri = null;
-			return result;
+		log(`CompletionTriggerManager: getCompletionResult called`);
+		log(`  - requested: ${documentUri}`);
+		log(`  - stored: ${this.completionDocUri}`);
+		log(`  - has result: ${!!this.completionResult}`);
+		log(`  - call count: ${this.resultCallCount}`);
+
+		if (this.completionDocUri === documentUri && this.completionResult) {
+			this.resultCallCount++;
+			// Keep result available for a few calls (VS Code may call multiple times)
+			if (this.resultCallCount > 3) {
+				log('Clearing result after multiple calls');
+				const result = this.completionResult;
+				this.completionResult = null;
+				this.completionDocUri = null;
+				return result;
+			}
+			return this.completionResult;
 		}
 		return null;
+	}
+
+	getLastCompletionText(): string | null {
+		return this.lastCompletionText;
+	}
+
+	clearResult(): void {
+		this.completionResult = null;
+		this.completionDocUri = null;
 	}
 
 	consumePending(): typeof this.pendingCompletion {
@@ -90,50 +148,53 @@ class CompletionTriggerManager {
 }
 
 /**
- * Service for calling LLM APIs
+ * Service for calling LLM APIs via Vercel AI SDK
  */
 class LLMService {
 	async getCompletion(
 		prompt: string,
 		config: vscode.WorkspaceConfiguration
 	): Promise<string | null> {
-		const apiEndpoint = config.get<string>('apiEndpoint');
-		const apiKey = config.get<string>('apiKey');
-		const model = config.get<string>('model', 'gpt-4');
-		const maxTokens = config.get<number>('maxTokens', 150);
+		const modelId = config.get<string>('model', 'us.anthropic.claude-3-5-haiku-20241022-v1:0');
+		const maxOutputTokens = config.get<number>('maxTokens', 150);
+		const region = config.get<string>('awsRegion', 'us-east-1');
 
-		if (!apiEndpoint || !apiKey) {
-			vscode.window.showWarningMessage(
-				'Complementry: Please configure API endpoint and key in settings'
-			);
-			return null;
-		}
+		log('=== LLM Request ===');
+		log(`Model: ${modelId}`);
+		log(`Region: ${region}`);
+		log(`Max tokens: ${maxOutputTokens}`);
+		log(`Prompt length: ${prompt.length} chars`);
+		log('Prompt:', prompt);
 
 		try {
-			const response = await fetch(apiEndpoint, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-					'Authorization': `Bearer ${apiKey}`
-				},
-				body: JSON.stringify({
-					model,
-					messages: [{ role: 'user', content: prompt }],
-					max_tokens: maxTokens,
-					temperature: 0.7
-				})
+			// Create Bedrock provider with region config and AWS credential chain (~/.aws)
+			const bedrock = createAmazonBedrock({
+				region,
+				credentialProvider: defaultProvider(),
 			});
 
-			if (!response.ok) {
-				throw new Error(`API request failed: ${response.statusText}`);
+			const result = await generateText({
+				model: bedrock(modelId),
+				prompt,
+				maxOutputTokens,
+				temperature: 0.7,
+			});
+
+			log('=== LLM Response ===');
+			log(`Text length: ${result.text?.length ?? 0} chars`);
+			log(`Finish reason: ${result.finishReason}`);
+			log(`Usage:`, result.usage);
+			log('Response text:', result.text);
+
+			if (!result.text) {
+				log('WARNING: Empty response from LLM');
 			}
 
-			const data = await response.json() as {
-				choices?: Array<{ message?: { content?: string } }>;
-			};
-			return data.choices?.[0]?.message?.content || null;
+			return result.text || null;
 		} catch (error) {
-			vscode.window.showErrorMessage(`Complementry: ${error}`);
+			log('=== LLM Error ===');
+			log(`Error: ${error}`);
+			setStatus('Error - see output', 'error', 5000);
 			return null;
 		}
 	}
@@ -204,23 +265,47 @@ class ComplementryCompletionProvider implements vscode.InlineCompletionItemProvi
 		context: vscode.InlineCompletionContext,
 		token: vscode.CancellationToken
 	): Promise<vscode.InlineCompletionItem[] | vscode.InlineCompletionList | null> {
+		log(`=== Provider Called ===`);
+		log(`Document: ${document.uri.toString()}`);
+		log(`Position: ${position.line}:${position.character}`);
+		log(`Trigger kind: ${context.triggerKind}`);
+
 		// Only provide completions for markdown files
 		if (document.languageId !== 'markdown') {
+			log('Not markdown, returning null');
 			return null;
 		}
 
 		// Check if we have a pre-computed completion result
 		const precomputed = this.triggerManager.getCompletionResult(document.uri.toString());
+		log(`Precomputed result: ${precomputed ? `${precomputed.length} items` : 'null'}`);
+
 		if (precomputed) {
+			log('Returning precomputed completion');
 			return precomputed;
 		}
 
 		// We don't provide automatic completions - only manual triggers
+		log('No precomputed result, returning null');
 		return null;
 	}
 }
 
 export function activate(context: vscode.ExtensionContext) {
+	// Create output channel for debugging
+	outputChannel = vscode.window.createOutputChannel('Complementry');
+	context.subscriptions.push(outputChannel);
+
+	// Create status bar item
+	statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+	statusBarItem.text = '$(sparkle) Complementry';
+	statusBarItem.tooltip = 'Complementry - Cmd+Shift+Space to trigger completion';
+	statusBarItem.command = 'complementry.triggerCompletion';
+	context.subscriptions.push(statusBarItem);
+	statusBarItem.show();
+
+	log('Complementry extension activating...');
+
 	const settingsManager = new DocumentSettingsManager();
 	const triggerManager = new CompletionTriggerManager();
 	const llmService = new LLMService();
@@ -244,9 +329,12 @@ export function activate(context: vscode.ExtensionContext) {
 	// Command: Trigger completion manually
 	context.subscriptions.push(
 		vscode.commands.registerCommand('complementry.triggerCompletion', async () => {
+			log('=== Trigger Completion Command ===');
+
 			const editor = vscode.window.activeTextEditor;
 			if (!editor || editor.document.languageId !== 'markdown') {
-				vscode.window.showWarningMessage('Complementry: Please open a markdown file');
+				log('No markdown editor active');
+				setStatus('Open a markdown file', 'warning', 3000);
 				return;
 			}
 
@@ -254,33 +342,36 @@ export function activate(context: vscode.ExtensionContext) {
 			const position = editor.selection.active;
 			const config = vscode.workspace.getConfiguration('complementry');
 
-			// Show progress while fetching completion
-			await vscode.window.withProgress(
-				{
-					location: vscode.ProgressLocation.Notification,
-					title: 'Complementry: Fetching completion...',
-					cancellable: true
-				},
-				async (progress, token) => {
-					const defaultTemplate = config.get<string>(
-						'defaultPromptTemplate',
-						'Continue writing the following markdown document naturally. Only provide the continuation text, no explanations:\n\n{document}\n\nContinuation:'
-					);
+			log(`Document: ${document.uri.fsPath}`);
+			log(`Cursor position: line ${position.line}, char ${position.character}`);
 
-					const prompt = await promptBuilder.buildPrompt(document, position, defaultTemplate);
-					const completion = await llmService.getCompletion(prompt, config);
+			setStatus('Fetching...', 'loading~spin');
 
-					if (completion && !token.isCancellationRequested) {
-						const item = new vscode.InlineCompletionItem(completion);
-						item.range = new vscode.Range(position, position);
-
-						triggerManager.setCompletionResult(document.uri.toString(), [item]);
-
-						// Trigger VS Code to request inline completions
-						await vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
-					}
-				}
+			const defaultTemplate = config.get<string>(
+				'defaultPromptTemplate',
+				'Continue writing the following markdown document naturally. Only provide the continuation text, no explanations:\n\n{document}\n\nContinuation:'
 			);
+
+			const prompt = await promptBuilder.buildPrompt(document, position, defaultTemplate);
+			const completion = await llmService.getCompletion(prompt, config);
+
+			log(`Completion received: ${completion ? `${completion.length} chars` : 'NULL'}`);
+
+			if (completion) {
+				const item = new vscode.InlineCompletionItem(completion);
+				item.range = new vscode.Range(position, position);
+
+				triggerManager.setCompletionResult(document.uri.toString(), [item]);
+				log('Triggering inline suggest...');
+
+				// Trigger VS Code to request inline completions
+				await vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
+				log('Inline suggest triggered');
+				setStatus('Ready - Tab to accept', 'check', 5000);
+			} else {
+				log('WARNING: No completion returned from LLM');
+				setStatus('No completion', 'warning', 3000);
+			}
 		})
 	);
 
@@ -308,14 +399,12 @@ export function activate(context: vscode.ExtensionContext) {
 
 			if (choice === 'View Current Settings') {
 				const contextFiles = settings.contextFiles.length > 0
-					? settings.contextFiles.join('\n  - ')
+					? settings.contextFiles.join(', ')
 					: 'None';
-				const template = settings.promptTemplate || 'Using default';
+				const template = settings.promptTemplate ? 'Custom' : 'Default';
 
-				vscode.window.showInformationMessage(
-					`Prompt: ${template}\n\nContext Files:\n  - ${contextFiles}`,
-					{ modal: true }
-				);
+				setStatus(`Template: ${template} | Context: ${contextFiles}`, 'info', 5000);
+				log(`Settings - Template: ${template}, Context files: ${contextFiles}`);
 			}
 		})
 	);
@@ -339,9 +428,7 @@ export function activate(context: vscode.ExtensionContext) {
 				for (const file of files) {
 					settingsManager.addContextFile(documentUri, file.fsPath);
 				}
-				vscode.window.showInformationMessage(
-					`Added ${files.length} context file(s)`
-				);
+				setStatus(`Added ${files.length} context file(s)`, 'check', 3000);
 			}
 		})
 	);
@@ -358,7 +445,7 @@ export function activate(context: vscode.ExtensionContext) {
 			const contextFiles = settingsManager.getContextFiles(documentUri);
 
 			if (contextFiles.length === 0) {
-				vscode.window.showInformationMessage('No context files configured');
+				setStatus('No context files configured', 'info', 3000);
 				return;
 			}
 
@@ -371,9 +458,7 @@ export function activate(context: vscode.ExtensionContext) {
 				for (const file of selected) {
 					settingsManager.removeContextFile(documentUri, file);
 				}
-				vscode.window.showInformationMessage(
-					`Removed ${selected.length} context file(s)`
-				);
+				setStatus(`Removed ${selected.length} context file(s)`, 'check', 3000);
 			}
 		})
 	);
@@ -399,12 +484,12 @@ export function activate(context: vscode.ExtensionContext) {
 
 			if (template !== undefined) {
 				settingsManager.setPromptTemplate(documentUri, template);
-				vscode.window.showInformationMessage('Prompt template updated');
+				setStatus('Prompt template updated', 'check', 3000);
 			}
 		})
 	);
 
-	console.log('Complementry extension activated');
+	log('Complementry extension activated successfully');
 }
 
 export function deactivate() {}
